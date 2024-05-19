@@ -1,4 +1,4 @@
-import os, net, strformat, strutils, posix
+import os, net, strformat, strutils, posix, threadpool
 
 # Function to set the timeout for a socket
 proc setSocketTimeout(socket: Socket, timeout: int) =
@@ -19,19 +19,24 @@ proc scanPort(host: string, port: int, timeout: int): bool =
     setSocketTimeout(socket, timeout)
     socket.connect(host, Port(port))
     return true
-  except OSError as e:
+  except OSError:
     return false
   finally:
     socket.close()
 
-# Function to scan a range of ports
+# Task function to scan a port and print the result
+proc scanPortTask(host: string, port: int, timeout: int, showClosedPorts: bool) {.thread.} =
+  if scanPort(host, port, timeout):
+    echo &"Port {port} is open"
+  elif showClosedPorts:
+    echo &"Port {port} is closed"
+
+# Function to scan a range of ports using multithreading
 proc scanPorts(host: string, startPort, endPort, timeout: int, showClosedPorts: bool) =
   echo &"Scanning {host} from port {startPort} to port {endPort}"
   for port in startPort..endPort:
-    if scanPort(host, port, timeout):
-      echo &"Port {port} is open"
-    elif showClosedPorts:
-      echo &"Port {port} is closed"
+    spawn scanPortTask(host, port, timeout, showClosedPorts)
+  threadpool.sync()  # Wait for all tasks to complete
 
 # Function to parse command-line arguments
 proc parseArgs(): (string, int, int, int, bool) =
