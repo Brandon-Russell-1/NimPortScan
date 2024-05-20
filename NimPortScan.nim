@@ -1,65 +1,125 @@
-import os, net, strformat, strutils, posix, threadpool
+import os, net, strformat, strutils, posix, threadpool, times
 
-# Function to set the timeout for a socket
 proc setSocketTimeout(socket: Socket, timeout: int) =
-  var tv: Timeval
-  tv.tv_sec = Time(timeout div 1000)        # Convert to Time (which is distinct clong)
-  tv.tv_usec = Suseconds((timeout mod 1000) * 1000)  # Convert to Suseconds (which is int)
-  let socklen = SockLen(sizeof(tv))
+  var tv: posix.Timeval
+  tv.tv_sec = posix.Time(timeout div 1000)
+  tv.tv_usec = posix.Suseconds((timeout mod 1000) * 1000)
+  let socklen = posix.SockLen(sizeof(tv))
   if setsockopt(socket.getFd(), SOL_SOCKET, SO_RCVTIMEO, cast[pointer](addr tv), socklen) != 0:
     raise newException(OSError, "Failed to set socket receive timeout")
   if setsockopt(socket.getFd(), SOL_SOCKET, SO_SNDTIMEO, cast[pointer](addr tv), socklen) != 0:
     raise newException(OSError, "Failed to set socket send timeout")
 
-# Function to scan a single TCP port with a timeout
-proc scanTcpPort(host: string, port: int, timeout: int): bool =
+proc scanTcpPort(host: string, port: int, timeout: int): string =
   var socket: Socket
   try:
     socket = newSocket()
+    if socket.getFd() == InvalidSocket:
+      raise newException(OSError, "Failed to create TCP socket")
     setSocketTimeout(socket, timeout)
     socket.connect(host, Port(port))
-    return true
-  except OSError:
-    return false
+    return "open"
+  except OSError as e:
+    echo "OSError during TCP scan: ", e.msg
+    return "closed"
   finally:
     socket.close()
 
-# Function to scan a single UDP port with a timeout
-proc scanUdpPort(host: string, port: int, timeout: int): bool =
-  var socket: Socket
+proc listenForICMP(icmpSocket: SocketHandle, timeout: int): string =
+  var buffer: array[256, char]
+  let startTime = epochTime()
+  while epochTime() - startTime < (float(timeout) / 1000.0):
+    try:
+      let bytesRead = posix.recv(icmpSocket, addr buffer, buffer.len, 0)
+      if bytesRead == -1:
+        let err = osLastError()
+        if err.int == EAGAIN or err.int == EWOULDBLOCK:
+          continue
+        else:
+          echo "ICMP recv error: ", strerror(cint(err))
+        return "open|filtered"
+      elif bytesRead > 0:
+        echo "Received packet of length: ", bytesRead
+        if bytesRead >= 28:
+          let ipHeaderLen = (buffer[0].ord and 0x0F) * 4
+          if ipHeaderLen + 8 <= bytesRead:
+            let icmpType = buffer[ipHeaderLen].ord
+            let icmpCode = buffer[ipHeaderLen + 1].ord
+            echo "ICMP type: ", icmpType, ", ICMP code: ", icmpCode
+            if icmpType == 3:
+              case icmpCode
+              of 1, 2, 9, 10, 13:
+                return "filtered"
+              of 3:
+                return "closed"
+              else:
+                return "open|filtered"
+            else:
+              return "open"  # Any other ICMP type is considered open
+    except OSError as e:
+      echo "OSError during recv: ", e.msg
+      discard
+  return "open|filtered"
+
+proc scanUdpPort(host: string, port: int, timeout: int, icmpSocket: SocketHandle): string =
+  var udpSocket: Socket
   try:
-    socket = newSocket(posix.AF_INET, posix.SOCK_DGRAM, posix.IPPROTO_UDP)
-    setSocketTimeout(socket, timeout)
-    socket.sendTo(host, Port(port), "test")
-    var buffer: array[256, char]
-    discard socket.recv(addr buffer, buffer.len)
-    return true
-  except OSError:
-    return false
+    udpSocket = newSocket(posix.AF_INET, posix.SOCK_DGRAM, posix.IPPROTO_UDP)
+    if udpSocket.getFd() == InvalidSocket:
+      raise newException(OSError, "Failed to create UDP socket")
+    setSocketTimeout(udpSocket, timeout)
+    udpSocket.sendTo(host, Port(port), "test")
+    return listenForICMP(icmpSocket, timeout)
+  except OSError as e:
+    echo "OSError during UDP scan: ", e.msg
+    return "open|filtered"
   finally:
-    socket.close()
+    udpSocket.close()
 
-# Task function to scan a port and print the result
-proc scanPortTask(host: string, port: int, timeout: int, showClosedPorts: bool, protocol: string) {.thread.} =
-  let openPort = if protocol == "tcp": scanTcpPort(host, port, timeout) else: scanUdpPort(host, port, timeout)
-  if openPort:
-    echo &"Port {port} ({protocol.toUpperAscii()}) is open"
+proc scanPortTask(host: string, port: int, timeout: int, showClosedPorts: bool, protocol: string, icmpSocket: SocketHandle) {.thread.} =
+  let state = if protocol == "tcp": scanTcpPort(host, port, timeout) else: scanUdpPort(host, port, timeout, icmpSocket)
+  if state == "open" or state == "filtered" or state == "open|filtered":
+    echo &"Port {port} ({protocol.toUpperAscii()}) is {state}"
   elif showClosedPorts:
-    echo &"Port {port} ({protocol.toUpperAscii()}) is closed"
+    echo &"Port {port} ({protocol.toUpperAscii()}) is {state}"
 
-# Function to scan a range of ports using multithreading
 proc scanPorts(host: string, startPort, endPort, timeout: int, showClosedPorts: bool, maxThreads: int, protocol: string) =
   echo &"Scanning {host} from port {startPort} to port {endPort} using {protocol.toUpperAscii()} with a max of {maxThreads} threads"
   var threadCount = 0
+  var icmpSocket: SocketHandle
+  if protocol == "udp":
+    try:
+      echo "Creating ICMP socket for UDP scanning"
+      icmpSocket = socket(posix.AF_INET, posix.SOCK_RAW, posix.IPPROTO_ICMP)
+      let fd = int(icmpSocket)
+      echo "ICMP socket created with fd: ", fd
+      if icmpSocket == InvalidSocket:
+        raise newException(OSError, "Failed to create ICMP socket")
+      let icmpSocketWrapper = newSocket(icmpSocket)
+      setSocketTimeout(icmpSocketWrapper, timeout)
+    except OSError as e:
+      echo "Error creating ICMP socket: ", e.msg
+      quit(1)
+    except RangeDefect as e:
+      echo "RangeDefect while creating ICMP socket: ", e.msg
+      quit(1)
+    except CatchableError as e:
+      echo "CatchableError while creating ICMP socket: ", e.msg
+      quit(1)
+    except Exception as e:
+      echo "Unhandled exception while creating ICMP socket: ", e.msg
+      quit(1)
   for port in startPort..endPort:
+    echo &"Spawning task for port {port}"
     if threadCount >= maxThreads:
-      threadpool.sync()  # Wait for some tasks to complete before spawning more
+      threadpool.sync()
       threadCount = 0
-    spawn scanPortTask(host, port, timeout, showClosedPorts, protocol)
+    spawn scanPortTask(host, port, timeout, showClosedPorts, protocol, icmpSocket)
     threadCount += 1
-  threadpool.sync()  # Wait for all tasks to complete
+  threadpool.sync()
+  if protocol == "udp":
+    discard close(icmpSocket)
 
-# Function to parse command-line arguments
 proc parseArgs(): (string, int, int, int, bool, int, string) =
   if paramCount() < 6 or paramCount() > 7:
     echo "Usage: port_scanner <IP address> <start port> <end port> <timeout> <maxThreads> <protocol> [showClosedPorts]"
@@ -79,11 +139,9 @@ proc parseArgs(): (string, int, int, int, bool, int, string) =
   
   return (ip, startPort, endPort, timeout, showClosedPorts, maxThreads, protocol)
 
-# Main function
 proc main() =
   let (host, startPort, endPort, timeout, showClosedPorts, maxThreads, protocol) = parseArgs()
   scanPorts(host, startPort, endPort, timeout, showClosedPorts, maxThreads, protocol)
 
-# Run the main function
 when isMainModule:
   main()
